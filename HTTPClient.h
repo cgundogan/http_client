@@ -19,6 +19,7 @@
 #define HTTP_CLIENT_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 typedef enum {
 	HTTP_PROCESSING, ///<Processing
@@ -42,6 +43,13 @@ typedef enum {
 	HTTP_DELETE,
 	HTTP_HEAD
 } http_method_t;
+
+typedef struct {
+	bool chunked;
+	char *type;
+	char *data;
+	int size;
+} http_data_t;
 
 typedef struct {
 
@@ -98,8 +106,8 @@ typedef struct {
 	 @param headers an array (size multiple of two) key-value pairs, must remain valid during the whole HTTP session
 	 @param pairs number of key-value pairs
 	 */
-	const char** m_customHeaders;
-	size_t m_nCustomHeaders;
+	const char** customHeaders;
+	size_t nCustomHeaders;
 
 	/**
 	 * response code of the http_do operation
@@ -112,6 +120,8 @@ typedef struct {
 	 */
 	int max_redirect;
 
+	int chunked_response;
+
 	/**
 	 * url got from previous request
 	 */
@@ -123,34 +133,33 @@ typedef struct {
 	http_data_t *data;
 } http_t;
 
-typedef struct {
-	bool chunked;
+#define HTTP_CHUNK_SIZE 256
 
-} http_data_t;
+typedef void (*http_on_data_cb_t)(http_t *h, const char *data, const int size);
 
 /**
  * create new http object
  */
-int http_new(http_t *r);
+void http_init(http_t *h);
 
 /**
  * parse url in r
  */
-int http_seturl(http_t *r, const char* url);
+int http_seturl(http_t *h, char* url);
 
 /**
  * set tcp socket to use
  */
-int http_setsocket(http_t *r, int sock);
+int http_setsocket(http_t *h, int sock);
 
 /**
  * set http method
  */
-int http_setmethod(http_t *r, http_method_t m);
+void http_setmethod(http_t *h, http_method_t m);
 
 /**
  * do the request
  */
-http_result_t http_do(http_t *r, char* result, size_t max_len);
+http_result_t http_do(http_t *h, http_on_data_cb_t *cb);
 
 #endif

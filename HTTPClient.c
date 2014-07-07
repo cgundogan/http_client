@@ -17,18 +17,19 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include <sys/socket.h>
 
 #include "HTTPClient.h"
 
 #define MIN(x,y) (((x)<(y))?(x):(y))
 #define MAX(x,y) (((x)>(y))?(x):(y))
 
-#define CHUNK_SIZE 256
-
 #define DEBUG printf
 
-static http_result_t http_recv(char* buf, size_t minLen, size_t maxLen,
-		size_t* pReadLen);
+static http_result_t http_recv(http_t *h, char* buf, size_t minLen, size_t maxLen,
+		size_t* pReadLen); //0 on success, err code on failure
 static http_result_t http_send(http_t *h, char* buf, size_t len);
 static void http_createauth(const char *user, const char *pwd, char *buf,
 		int len);
@@ -50,7 +51,7 @@ char *http_method(http_method_t m) {
 	}
 }
 
-void http_new(http_t *h) {
+void http_init(http_t *h) {
 	memset(h, 0, sizeof(http_t));
 
 	h->port = 80;
@@ -62,25 +63,21 @@ void http_setmethod(http_t *h, http_method_t m) {
 	h->method = m;
 }
 
-http_result_t http_do(http_t *h, char* result, size_t max_len) //const char* url, HTTP_METH method, IHTTPDataOut* pDataOut, IHTTPDataIn* pDataIn, int timeout) //Execute request
-		{
+char http_io_buf[HTTP_CHUNK_SIZE];
 
-	char scheme[8];
-	uint16_t port;
-	char host[32];
-	char path[64];
+http_result_t http_do(http_t *h, http_on_data_cb_t *cb)
+{
 	size_t recvContentLength = 0;
-	bool recvChunked = false;
 	int crlfPos = 0;
-	char buf[CHUNK_SIZE];
+
 	size_t trfLen;
 	int ret = 0;
 
 	//Send request
-	snprintf(buf, sizeof(buf),
+	snprintf(http_io_buf, sizeof(http_io_buf),
 			"%s %s HTTP/1.1\r\nHost: %s:%d\r\nConnection: keep-alive\r\n",
 			h->method, h->path, h->host, h->port); //Write request
-	ret = http_send(h, buf, sizeof(buf));
+	ret = http_send(h, http_io_buf, sizeof(http_io_buf));
 	if (ret) {
 		DEBUG("Could not write request");
 		return HTTP_CONN;
@@ -88,12 +85,12 @@ http_result_t http_do(http_t *h, char* result, size_t max_len) //const char* url
 
 	// send authorization
 	if (h->basicAuthUser && h->basicAuthPassword) {
-		strcpy(buf, "Authorization: Basic ");
+		strcpy(http_io_buf, "Authorization: Basic ");
 		http_createauth(h->basicAuthUser, h->basicAuthPassword,
-				buf + strlen(buf), sizeof(buf) - strlen(buf));
-		strcat(buf, "\r\n");
-		DEBUG(" (%s,%s) => (%s)", h->basicAuthUser, h->basicAuthPassword, buf);
-		ret = http_send(h, buf, 0);
+				http_io_buf + strlen(http_io_buf), sizeof(http_io_buf) - strlen(http_io_buf));
+		strcat(http_io_buf, "\r\n");
+		DEBUG(" (%s,%s) => (%s)", h->basicAuthUser, h->basicAuthPassword, http_io_buf);
+		ret = http_send(h, http_io_buf, 0);
 		DEBUG(" ret = %d", ret);
 		if (ret) {
 			DEBUG("Could not write request");
@@ -106,9 +103,9 @@ http_result_t http_do(http_t *h, char* result, size_t max_len) //const char* url
 	for (size_t nh = 0; nh < h->nCustomHeaders * 2; nh += 2) {
 		DEBUG("hdr[%d] %s:", nh, h->customHeaders[nh]);
 		DEBUG("        %s", h->customHeaders[nh + 1]);
-		int size = snprintf(buf, sizeof(buf), "%s: %s\r\n",
+		int size = snprintf(http_io_buf, sizeof(http_io_buf), "%s: %s\r\n",
 				h->customHeaders[nh], h->customHeaders[nh + 1]);
-		ret = http_send(h, buf, size);
+		ret = http_send(h, http_io_buf, size);
 		if (ret) {
 			DEBUG("Could not write request");
 			return HTTP_CONN;
@@ -118,19 +115,17 @@ http_result_t http_do(http_t *h, char* result, size_t max_len) //const char* url
 
 	//Send default headers
 	DEBUG("Sending headers");
-	if (pDataOut != NULL) {
-		if (pDataOut->getIsChunked()) {
+	if (h->data != NULL) {
+		if (h->data->chunked) {
 			ret = http_send(h, "Transfer-Encoding: chunked\r\n", 0);
 		} else {
-			snprintf(buf, sizeof(buf), "Content-Length: %d\r\n",
-					pDataOut->getDataLen());
-			ret = http_send(h, buf, 0);
+			snprintf(http_io_buf, sizeof(http_io_buf), "Content-Length: %d\r\n",
+					h->data->size);
+			ret = http_send(h, http_io_buf, 0);
 		}
-		char type[48];
-		if (pDataOut->getDataType(type, 48) == HTTP_OK) {
-			snprintf(buf, sizeof(buf), "Content-Type: %s\r\n", type);
-			ret = http_send(h, buf, 0);
-		}
+
+		snprintf(http_io_buf, sizeof(http_io_buf), "Content-Type: %s\r\n", h->data->type);
+		ret = http_send(h, http_io_buf, 0);
 	}
 
 	//Close headers
@@ -138,58 +133,33 @@ http_result_t http_do(http_t *h, char* result, size_t max_len) //const char* url
 	ret = http_send(h, "\r\n", 0);
 
 	//Send data (if available)
-	if (pDataOut != NULL) {
+	if (h->data != NULL) {
 		DEBUG("Sending data");
-		while (true) {
-			size_t writtenLen = 0;
-			pDataOut->read(buf, CHUNK_SIZE, &trfLen);
-			if (pDataOut->getIsChunked()) {
-				//Write chunk header
-				char chunkHeader[16];
-				snprintf(chunkHeader, sizeof(chunkHeader), "%X\r\n", trfLen); //In hex encoding
-				ret = gttp_send(h, chunkHeader, 0);
-			} else if (trfLen == 0) {
-				break;
-			}
-			if (trfLen != 0) {
-				ret = http_send(h, buf, trfLen);
-			}
-
-			if (pDataOut->getIsChunked()) {
-				ret = http_send(h, "\r\n", 0); //Chunk-terminating CRLF
-			} else {
-				writtenLen += trfLen;
-				if (writtenLen >= pDataOut->getDataLen()) {
-					break;
-				}
-			}
-
-			if (trfLen == 0) {
-				break;
-			}
+		int pos = 0;
+		while (pos != h->data->size) {
+			pos += http_send(h, h->data->data[pos], h->data->size - pos);
 		}
-
 	}
 
 	//Receive response
 	DEBUG("Receiving response");
 	//ret = recv(buf, CHUNK_SIZE - 1, CHUNK_SIZE - 1, &trfLen); //Read n bytes
-	ret = http_recv(buf, 1, CHUNK_SIZE - 1, &trfLen); // recommended by Rob Noble to avoid timeout wait
-	buf[trfLen] = '\0';
-	DEBUG("Received \r\n(%s\r\n)", buf);
+	ret = http_recv(http_io_buf, 1, HTTP_CHUNK_SIZE - 1, &trfLen); // recommended by Rob Noble to avoid timeout wait
+	http_io_buf[trfLen] = '\0';
+	DEBUG("Received \r\n(%s\r\n)", http_io_buf);
 
-	char* crlfPtr = strstr(buf, "\r\n");
+	char* crlfPtr = strstr(http_io_buf, "\r\n");
 	if (crlfPtr == NULL) {
 		return -1;
 	}
 
-	crlfPos = crlfPtr - buf;
-	buf[crlfPos] = '\0';
+	crlfPos = crlfPtr - http_io_buf;
+	http_io_buf[crlfPos] = '\0';
 
 	//Parse HTTP response
-	if (sscanf(buf, "HTTP/%*d.%*d %d %*[^\r\n]", &h->httpResponseCode) != 1) {
+	if (sscanf(http_io_buf, "HTTP/%*d.%*d %d %*[^\r\n]", &h->httpResponseCode) != 1) {
 		//Cannot match string, error
-		DEBUG("Not a correct HTTP answer : {%s}\n", buf);
+		DEBUG("Not a correct HTTP answer : {%s}\n", http_io_buf);
 	}
 
 	if ((h->httpResponseCode < 200) || (h->httpResponseCode >= 400)) {
@@ -199,38 +169,37 @@ http_result_t http_do(http_t *h, char* result, size_t max_len) //const char* url
 
 	DEBUG("Reading headers");
 
-	memmove(buf, &buf[crlfPos + 2], trfLen - (crlfPos + 2) + 1); //Be sure to move NULL-terminating char as well
+	memmove(http_io_buf, &http_io_buf[crlfPos + 2], trfLen - (crlfPos + 2) + 1); //Be sure to move NULL-terminating char as well
 	trfLen -= (crlfPos + 2);
 
 	recvContentLength = 0;
-	recvChunked = false;
 	//Now get headers
 	while (true) {
-		crlfPtr = strstr(buf, "\r\n");
+		crlfPtr = strstr(http_io_buf, "\r\n");
 		if (crlfPtr == NULL) {
-			if (trfLen < CHUNK_SIZE - 1) {
+			if (trfLen < HTTP_CHUNK_SIZE - 1) {
 				size_t newTrfLen = 0;
-				ret = http_recv(buf + trfLen, 1, CHUNK_SIZE - trfLen - 1,
+				ret = http_recv(http_io_buf + trfLen, 1, HTTP_CHUNK_SIZE - trfLen - 1,
 						&newTrfLen);
 				trfLen += newTrfLen;
-				buf[trfLen] = '\0';
-				DEBUG("Read %d chars; In buf: [%s]", newTrfLen, buf);
+				http_io_buf[trfLen] = '\0';
+				DEBUG("Read %d chars; In buf: [%s]", newTrfLen, http_io_buf);
 				continue;
 			} else {
 				return -1;
 			}
 		}
 
-		crlfPos = crlfPtr - buf;
+		crlfPos = crlfPtr - http_io_buf;
 
 		if (crlfPos == 0) { //End of headers
 			DEBUG("Headers read");
-			memmove(buf, &buf[2], trfLen - 2 + 1); //Be sure to move NULL-terminating char as well
+			memmove(http_io_buf, &http_io_buf[2], trfLen - 2 + 1); //Be sure to move NULL-terminating char as well
 			trfLen -= 2;
 			break;
 		}
 
-		buf[crlfPos] = '\0';
+		http_io_buf[crlfPos] = '\0';
 
 		char key[32];
 		char value[64];
@@ -238,34 +207,33 @@ http_result_t http_do(http_t *h, char* result, size_t max_len) //const char* url
 		key[31] = '\0';
 		value[63] = '\0';
 
-		int n = sscanf(buf, "%31[^:]: %63[^\r\n]", key, value);
+		http_data_t data;
+
+		int n = sscanf(http_io_buf, "%31[^:]: %63[^\r\n]", key, value);
 		if (n == 2) {
 			DEBUG("Read header : %s: %s", key, value);
 			if (!strcmp(key, "Content-Length")) {
 				sscanf(value, "%d", &recvContentLength);
-				pDataIn->setDataLen(recvContentLength);
+				data.size = recvContentLength;
 			} else if (!strcmp(key, "Transfer-Encoding")) {
 				if (!strcmp(value, "Chunked") || !strcmp(value, "chunked")) {
-					recvChunked = true;
-					pDataIn->setIsChunked(true);
+					data.chunked = true;
+					h->chunked_response = true;
 				}
 			} else if (!strcmp(key, "Content-Type")) {
-				pDataIn->setDataType(value);
+				data.type = value;
 			} else if (!strcmp(key, "Location")) {
-				if (m_location)
-					free (m_location);
-				m_location = (char *) malloc(strlen(value) + 1);
-				if (m_location) {
-					strcpy(m_location, value);
-					url = m_location;
-					INFO("Following redirect[%d] to [%s]", maxRedirect, url);
-					m_sock.close();
-					takeRedirect = true;
+				if (h->redirected_to)
+					free(h->redirected_to);
+				h->redirected_to = (char *) malloc(strlen(value) + 1);
+				if (h->redirected_to) {
+					strcpy(h->redirected_to, value);
+					INFO("Following redirect[%d] to [%s]", h->max_redirect, h->redirected_to);
 					break; // exit the while(true) header to follow the redirect
 				}
 			}
 
-			memmove(buf, &buf[crlfPos + 2], trfLen - (crlfPos + 2) + 1); //Be sure to move NULL-terminating char as well
+			memmove(http_io_buf, &http_io_buf[crlfPos + 2], trfLen - (crlfPos + 2) + 1); //Be sure to move NULL-terminating char as well
 			trfLen -= (crlfPos + 2);
 
 		} else {
@@ -279,26 +247,26 @@ http_result_t http_do(http_t *h, char* result, size_t max_len) //const char* url
 	while (true) {
 		size_t readLen = 0;
 
-		if (recvChunked) {
+		if (h->chunked_response) {
 			//Read chunk header
 			bool foundCrlf;
 			do {
 				foundCrlf = false;
 				crlfPos = 0;
-				buf[trfLen] = 0;
+				http_io_buf[trfLen] = 0;
 				if (trfLen >= 2) {
 					for (; crlfPos < trfLen - 2; crlfPos++) {
-						if (buf[crlfPos] == '\r' && buf[crlfPos + 1] == '\n') {
+						if (http_io_buf[crlfPos] == '\r' && http_io_buf[crlfPos + 1] == '\n') {
 							foundCrlf = true;
 							break;
 						}
 					}
 				}
 				if (!foundCrlf) { //Try to read more
-					if (trfLen < CHUNK_SIZE) {
+					if (trfLen < HTTP_CHUNK_SIZE) {
 						size_t newTrfLen = 0;
-						ret = http_recv(buf + trfLen, 0,
-								CHUNK_SIZE - trfLen - 1, &newTrfLen);
+						ret = http_recv(http_io_buf + trfLen, 0,
+						HTTP_CHUNK_SIZE - trfLen - 1, &newTrfLen);
 						trfLen += newTrfLen;
 						continue;
 					} else {
@@ -306,14 +274,14 @@ http_result_t http_do(http_t *h, char* result, size_t max_len) //const char* url
 					}
 				}
 			} while (!foundCrlf);
-			buf[crlfPos] = '\0';
-			int n = sscanf(buf, "%x", &readLen);
+			http_io_buf[crlfPos] = '\0';
+			int n = sscanf(http_io_buf, "%x", &readLen);
 			if (n != 1) {
 				DEBUG("Could not read chunk length");
 				return -1;
 			}
 
-			memmove(buf, &buf[crlfPos + 2], trfLen - (crlfPos + 2)); //Not need to move NULL-terminating char any more
+			memmove(http_io_buf, &http_io_buf[crlfPos + 2], trfLen - (crlfPos + 2)); //Not need to move NULL-terminating char any more
 			trfLen -= (crlfPos + 2);
 
 			if (readLen == 0) {
@@ -327,9 +295,12 @@ http_result_t http_do(http_t *h, char* result, size_t max_len) //const char* url
 		DEBUG("Retrieving %d bytes", readLen);
 
 		do {
-			pDataIn->write(buf, MIN(trfLen, readLen));
+			http_data_t *data;
+			data->data = http_io_buf;
+			data->size = MIN(trfLen, readLen);
+			cb(h, data);
 			if (trfLen > readLen) {
-				memmove(buf, &buf[readLen], trfLen - readLen);
+				memmove(http_io_buf, &http_io_buf[readLen], trfLen - readLen);
 				trfLen -= readLen;
 				readLen = 0;
 			} else {
@@ -337,23 +308,23 @@ http_result_t http_do(http_t *h, char* result, size_t max_len) //const char* url
 			}
 
 			if (readLen) {
-				ret = http_recv(buf, 1, CHUNK_SIZE - trfLen - 1, &trfLen);
+				ret = http_recv(http_io_buf, 1, HTTP_CHUNK_SIZE - trfLen - 1, &trfLen);
 			}
 		} while (readLen);
 
-		if (recvChunked) {
+		if (h->chunked_response) {
 			if (trfLen < 2) {
 				size_t newTrfLen;
 				//Read missing chars to find end of chunk
-				ret = http_recv(buf + trfLen, 2 - trfLen,
-						CHUNK_SIZE - trfLen - 1, &newTrfLen);
+				ret = http_recv(http_io_buf + trfLen, 2 - trfLen,
+				HTTP_CHUNK_SIZE - trfLen - 1, &newTrfLen);
 				trfLen += newTrfLen;
 			}
-			if ((buf[0] != '\r') || (buf[1] != '\n')) {
+			if ((http_io_buf[0] != '\r') || (http_io_buf[1] != '\n')) {
 				DEBUG("Format error");
 				return -1;
 			}
-			memmove(buf, &buf[2], trfLen - 2);
+			memmove(http_io_buf, &http_io_buf[2], trfLen - 2);
 			trfLen -= 2;
 		} else {
 			break;
@@ -365,9 +336,9 @@ http_result_t http_do(http_t *h, char* result, size_t max_len) //const char* url
 	return HTTP_OK;
 }
 
-static http_result_t http_recv(char* buf, size_t minLen, size_t maxLen,
+static http_result_t http_recv(http_t *h, char* buf, size_t minLen, size_t maxLen,
 		size_t* pReadLen) //0 on success, err code on failure
-		{
+{
 	DEBUG("Trying to read between %d and %d bytes", minLen, maxLen);
 	size_t readLen = 0;
 
@@ -376,7 +347,7 @@ static http_result_t http_recv(char* buf, size_t minLen, size_t maxLen,
 		if (readLen < minLen) {
 			DEBUG("Trying to read at most %d bytes [Blocking]",
 					minLen - readLen);
-			ret = m_sock.receive_all(buf + readLen, minLen - readLen);
+			ret = read(h->socket, buf + readLen, minLen - readLen);
 		}
 
 		if (ret > 0) {
@@ -384,7 +355,10 @@ static http_result_t http_recv(char* buf, size_t minLen, size_t maxLen,
 		} else if (ret == 0) {
 			break;
 		} else {
-			if (!m_sock.is_connected()) {
+			int error = 0;
+			socklen_t len = sizeof (error);
+			int retval = getsockopt (h->socket, SOL_SOCKET, SO_ERROR, &error, &len );
+			if (!retval) {
 				DEBUG("Connection error (recv returned %d)", ret);
 				*pReadLen = readLen;
 				return HTTP_CONN;
@@ -400,14 +374,14 @@ static http_result_t http_recv(char* buf, size_t minLen, size_t maxLen,
 }
 
 static http_result_t http_send(http_t *h, char* buf, size_t len) //0 on success, err code on failure
-		{
+{
 	if (len == 0) {
 		len = strlen(buf);
 	}
 	DEBUG("send(%s,%d)", buf, len);
 	size_t writtenLen = 0;
 
-	int ret = m_sock.send_all(buf, len);
+	int ret = write(h->socket, buf, len);
 	if (ret > 0) {
 		writtenLen += ret;
 	} else if (ret == 0) {
@@ -422,22 +396,14 @@ static http_result_t http_send(http_t *h, char* buf, size_t len) //0 on success,
 	return HTTP_OK;
 }
 
-http_result_t http_seturl(const http_t *h, const char* url) //, char* scheme, size_t maxSchemeLen, char* host, size_t maxHostLen, uint16_t* port, char* path, size_t maxPathLen) //Parse URL
-		{
+int http_seturl(http_t *h, char* url) //, char* scheme, size_t maxSchemeLen, char* host, size_t maxHostLen, uint16_t* port, char* path, size_t maxPathLen) //Parse URL
+{
 	char* schemePtr = (char*) url;
 	char* hostPtr = (char*) strstr(url, "://");
 	if (hostPtr == NULL) {
 		DEBUG("Could not find host");
 		return HTTP_PARSE; //URL is invalid
 	}
-
-	if (maxSchemeLen < hostPtr - schemePtr + 1) { //including NULL-terminating char
-		DEBUG("Scheme str is too small (%d >= %d)", maxSchemeLen,
-				hostPtr - schemePtr + 1);
-		return HTTP_PARSE;
-	}
-	memcpy(scheme, schemePtr, hostPtr - schemePtr);
-	scheme[hostPtr - schemePtr] = '\0';
 
 	hostPtr += 3;
 
@@ -451,20 +417,14 @@ http_result_t http_seturl(const http_t *h, const char* url) //, char* scheme, si
 			DEBUG("Could not find port");
 			return HTTP_PARSE;
 		}
-	} else {
-		*port = 0;
 	}
 	char* pathPtr = strchr(hostPtr, '/');
 	if (hostLen == 0) {
 		hostLen = pathPtr - hostPtr;
 	}
 
-	if (maxHostLen < hostLen + 1) { //including NULL-terminating char
-		DEBUG("Host str is too small (%d >= %d)", maxHostLen, hostLen + 1);
-		return HTTP_PARSE;
-	}
-	memcpy(host, hostPtr, hostLen);
-	host[hostLen] = '\0';
+	h->host = strdup(hostPtr);
+	h->host[hostLen] = '\0';
 
 	size_t pathLen;
 	char* fragmentPtr = strchr(hostPtr, '#');
@@ -474,12 +434,8 @@ http_result_t http_seturl(const http_t *h, const char* url) //, char* scheme, si
 		pathLen = strlen(pathPtr);
 	}
 
-	if (maxPathLen < pathLen + 1) { //including NULL-terminating char
-		DEBUG("Path str is too small (%d >= %d)", maxPathLen, pathLen + 1);
-		return HTTP_PARSE;
-	}
-	memcpy(path, pathPtr, pathLen);
-	path[pathLen] = '\0';
+	h->path = strdup(pathPtr);
+	h->path[pathLen] = '\0';
 
 	return HTTP_OK;
 }

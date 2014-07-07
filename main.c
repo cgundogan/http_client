@@ -26,31 +26,64 @@
  * @}
  */
 
+#include <arpa/inet.h>
+
 #include "HTTPClient.h"
 
-char buf[1000];
-#define URL "http://google.com/"
+char print_buf[1000];
+#define HOST "bing.com"
+#define IP "204.79.197.200"
 
-int sock = 0;
+int open_tcp_connection(void) {
+	int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+	if (sockfd < 0) {
+		perror("ERROR opening socket");
+		return -1;
+	}
+	struct in_addr addr;
+	inet_aton(IP, &addr);
+
+	int ret = connect(sockfd, (struct sockaddr *) &addr, sizeof(struct in_addr));
+	if (ret < 0) {
+		perror("ERROR connecting");
+		close(sockfd);
+		return -1;
+	}
+
+	return sockfd;
+}
+
+void on_data(http_t *h, http_data_t *d) {
+	memset(print_buf, 0, 1000);
+
+	if (d->size != 0) {
+		memcpy(print_buf, d->data, d->size);
+		print_buf[d->size] = '\0';
+		printf("chunk: '%s'\n", print_buf);
+	} else {
+		printf("end...\n");
+	}
+}
 
 int main(void) {
 	http_t h;
-	http_new(&h);
+	http_init(&h);
 
-	http_seturl(&h, URL);
-	http_setsocket(&h, sock);
-
-	memset(buf, 0, sizeof(buf));
+	http_seturl(&h, "http://" HOST "/");
 
 	http_result_t r = HTTP_PROCESSING;
 	while (r != HTTP_OK && h.max_redirect--) {
-		r = http_do(&h, buf, sizeof(buf));
+		/* TODO: do dns querry */
+		/* TODO: open socket to host */
+		http_setsocket(&h, open_tcp_connection());
+		r = http_do(&h, on_data);
 
 		if (r == HTTP_REDIRECT) {
 			http_seturl(&h, h.redirected_to);
-			http_setsocket(&h, sock); /*   TODO: open new tcp socket to host */
 		}
 	}
 
-	printf("RESULT %s: %s", http_result(r), buf);
+	if (r == HTTP_OK) {
+		printf("HTTP DONE\n");
+	}
 }
